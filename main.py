@@ -542,21 +542,38 @@ def acceleration_srp(r_sat: tuple[float, float, float],
                      Cr: float = CR_DEFAULT,
                      A_mass: float = AREA_M_RATIO) -> tuple[float, float, float]:
     """
-    תאוצת Solar Radiation Pressure (שטח/מסה יחסי + Cr).
-    לחץ קרינתי: 4.56e-6 N/m² ב-1 AU.
+    Solar-Radiation-Pressure acceleration (m/s²).
+
+    • הכיוון הוא *מהשמש החוצה* (Sun → Satellite)
+    • אם הלוויין בצל כדוה״א (מודל גליל פשוט) ⇒ SRP = 0
     """
-    dx = r_sat[0] - r_sun[0]
-    dy = r_sat[1] - r_sun[1]
-    dz = r_sat[2] - r_sun[2]
+    sx, sy, sz = r_sun
+    rx, ry, rz = r_sat
+
+    # וקטור מהשמש אל הלוויין
+    dx = rx - sx
+    dy = ry - sy
+    dz = rz - sz
     d2 = dx*dx + dy*dy + dz*dz
     d  = math.sqrt(d2)
 
-    P0 = 4.56e-6           # N/m²
-    accel = P0 * Cr * A_mass * (AU / d)**2   # [m/s²]
+    # ---------- צִלָּה (Umbra) – בדיקת גליל ------------------
+    dot_rs = rx*sx + ry*sy + rz*sz          # r_sat · r_sun
+    if dot_rs < 0:                          # הלוויין "מאחורי" כדוה״א
+        sun_norm2 = sx*sx + sy*sy + sz*sz
+        # מרחק מאונך מציר השמש
+        perp2 = (d2 * sun_norm2 - dot_rs**2) / sun_norm2
+        if perp2 < R_E**2:
+            return (0.0, 0.0, 0.0)          # בתוך צל ⇒ אין SRP
 
-    ax = -accel * dx / d
-    ay = -accel * dy / d
-    az = -accel * dz / d
+    # ---------- גודל התאוצה -------------------------------
+    P0 = 4.56e-6                            # N/m² ב-1 AU
+    a_mag = P0 * Cr * A_mass * (AU / d)**2  # [m/s²]
+
+    inv_d = 1.0 / d
+    ax =  a_mag * dx * inv_d   # ❶ **כיוון החוצה מהשמש**
+    ay =  a_mag * dy * inv_d
+    az =  a_mag * dz * inv_d
     return ax, ay, az
 
 
@@ -881,6 +898,6 @@ if __name__ == "__main__":
     run_propagation_tests(
         sat_name="G01",         # לווין GPS לדוגמה
         epoch0_index=0,         # אפוק התחלתי
-        delta_minutes_list=(24*60, 48*60, 72*60),
+        delta_minutes_list=(72*60, 4*24*60, 5*24*60),
         step_seconds=60.0       # צעד RK
     )

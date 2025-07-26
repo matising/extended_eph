@@ -4,20 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="cfc7cff6-099e-49aa-b757-f994c3451598" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/ephemeris_prop.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/BRDM00DLR_S_20251960000_01D_MN.rnx" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/rinex/BRDM00DLR_S_20252000000_01D_MN.rnx.gz" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/rinex/BRDM00DLR_S_20252010000_01D_MN.rnx.gz" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/rinex/BRDM00DLR_S_20252020000_01D_MN.rnx.gz" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/rinex/BRDM00DLR_S_20252030000_01D_MN.rnx.gz" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/rinex/BRDM00DLR_S_20252040000_01D_MN.rnx.gz" afterDir="false" />
+    <list default="true" id="cfc7cff6-099e-49aa-b757-f994c3451598" name="Changes" comment="commit of a working extended ephemeris. SRP does not seem to work though, but the results here are acceptable.">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -27,6 +16,18 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "matising"
+  }
+}]]></component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "https://github.com/matising/extended_eph.git",
+    "accountId": "848bdfb0-0b9b-4d3e-9f94-073a9f830c70"
+  }
+}]]></component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 2
 }</component>
@@ -90,6 +91,30 @@
       <option name="presentableId" value="Default" />
       <updated>1752844415586</updated>
     </task>
+    <task id="LOCAL‎-00001" summary="commit of a working extended ephemeris. SRP does not seem to work though, but the results here are acceptable.">
+      <option name="closed" value="true" />
+      <created>1753457094208</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL‎-00001" />
+      <option name="project" value="LOCAL‎" />
+      <updated>1753457094208</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="commit of a working extended ephemeris. SRP does not seem to work though, but the results here are acceptable." />
+    <option name="LAST_COMMIT_MESSAGE" value="commit of a working extended ephemeris. SRP does not seem to work though, but the results here are acceptable." />
   </component>
 </project>
