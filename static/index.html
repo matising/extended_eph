@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RINEX Propagator</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f4f9;
+            color: #333;
+            display: flex;
+            justify_content: center;
+            align_items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: 400px;
+            text-align: center;
+        }
+        h1 {
+            color: #2c3e50;
+        }
+        .status {
+            margin-bottom: 1.5rem;
+            font-size: 0.9rem;
+            color: #7f8c8d;
+        }
+        .input-group {
+            margin-bottom: 1.5rem;
+            text-align: left;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: bold;
+        }
+        input[type="number"] {
+            width: 100%;
+            padding: 0.5rem;
+            border: 1px solid #bdc3c7;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+        }
+        .message {
+            margin-top: 1rem;
+            font-size: 0.9rem;
+        }
+        .error {
+            color: #e74c3c;
+        }
+        .success {
+            color: #27ae60;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>RINEX Propagator</h1>
+        <div class="status" id="status">Loading status...</div>
+        
+        <div class="input-group">
+            <label for="days">Propagation Duration (Days):</label>
+            <input type="number" id="days" name="days" min="1" max="14" value="7">
+        </div>
+        
+        <button id="submitBtn" onclick="propagate()">Generate & Download</button>
+        
+        <div class="message" id="message"></div>
+    </div>
+
+    <script>
+        async function checkStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                const statusDiv = document.getElementById('status');
+                const btn = document.getElementById('submitBtn');
+                
+                if (data.is_updating) {
+                    statusDiv.innerHTML = 'System is updating RINEX data... <span style="color: orange;">(Please wait)</span>';
+                    btn.disabled = true;
+                } else if (data.last_updated) {
+                    statusDiv.innerHTML = `Last updated: ${new Date(data.last_updated).toLocaleString()}<br>Satellites: ${data.satellites_count}`;
+                    btn.disabled = false;
+                } else {
+                    statusDiv.innerHTML = 'System initializing...';
+                    btn.disabled = true;
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function propagate() {
+            const days = document.getElementById('days').value;
+            const btn = document.getElementById('submitBtn');
+            const msg = document.getElementById('message');
+            
+            btn.disabled = true;
+            msg.textContent = 'Generating file...';
+            msg.className = 'message';
+
+            try {
+                const response = await fetch('/propagate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ days: parseInt(days) }),
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || 'Failed to generate file');
+                }
+
+                // Trigger download
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `propagated_${days}d.rnx`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                a.remove();
+                
+                msg.textContent = 'Download started!';
+                msg.className = 'message success';
+            } catch (e) {
+                msg.textContent = `Error: ${e.message}`;
+                msg.className = 'message error';
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // Poll status every 5 seconds
+        setInterval(checkStatus, 5000);
+        checkStatus();
+    </script>
+</body>
+</html>

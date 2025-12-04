@@ -2,7 +2,15 @@ import datetime, math, pandas as pd
 import os
 import gzip
 import glob
+import requests
+from pathlib import Path
 from math import sin, cos, sqrt, atan2, radians
+from datetime import timedelta
+from functools import lru_cache
+import cProfile, pstats, io
+import matplotlib.pyplot as plt
+import statistics as stats
+from collections import defaultdict
 
 MU       = 3.986005e14       # ‎μ‎ של כדור-הארץ [m³/s²] (ערך ה-GPS)
 OMEGA_E  = 7.2921151467e-5   # קצב הסיבוב של כדוה"א [rad/s]
@@ -26,6 +34,43 @@ from skyfield.api import load
 _eph  = load('de421.bsp')
 _ts   = load.timescale()
 earth = _eph['earth']
+# Cache handles to bodies
+_sun  = _eph['sun']
+_moon = _eph['moon']
+
+@lru_cache(maxsize=200000)
+def _skyfield_time(epoch: datetime.datetime):
+    """LRU-cached Skyfield Time construction (UTC)."""
+    return _ts.utc(epoch.year, epoch.month, epoch.day,
+                   epoch.hour, epoch.minute,
+                   epoch.second + epoch.microsecond/1e6)
+
+# ---------------------------------------------------------------------------
+#  cProfile helper – run a callable and print/save profiling statistics
+# ---------------------------------------------------------------------------
+def run_with_cprofile(func, *args, **kwargs):
+    pr = cProfile.Profile()
+    pr.enable()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        pr.disable()
+        s = io.StringIO()
+        stats = pstats.Stats(pr, stream=s).strip_dirs()
+        # Print top by cumulative time and total time
+        stats.sort_stats('cumulative').print_stats(50)
+        stats.sort_stats('tottime').print_stats(30)
+        # Focus on our hotspots (printed again for quick visibility)
+        for flt in (
+            'sun_position_eci', 'moon_position_eci', '_skyfield_time',
+            'acceleration_third_body', 'acceleration_srp',
+            'acceleration_total', 'rk4_step', 'propagate_rk4'
+        ):
+            stats.sort_stats('cumulative').print_stats(flt)
+        print("\n[cProfile] ---- Summary (top cumulative, tot time, and focused funcs) ----\n")
+        print(s.getvalue())
+        pr.dump_stats('profile_run.prof')
+        print('[cProfile] Raw stats saved to profile_run.prof  (use snakeviz/gprof2dot to visualize)')
 
 # ---- Parameter name lookup tables for each constellation ---- #
 PARAM_MAPS = {
@@ -71,12 +116,26 @@ PARAM_MAPS = {
         'Y', 'Y_velocity', 'Y_acceleration', 'PRN',
         'Z', 'Z_velocity', 'Z_acceleration', 'IODN'
     ],
-    'I': [  # IRNSS – treat like GPS (7 data lines)
-        'SV_clock_bias', 'SV_clock_drift', 'SV_clock_drift_rate'
-    ] + [f'param_{k}' for k in range(29)],
-    'J': [  # QZSS – same layout as GPS
-        'SV_clock_bias', 'SV_clock_drift', 'SV_clock_drift_rate'
-    ] + [f'param_{k}' for k in range(29)],
+    'I': [  # IRNSS/NavIC – same layout as GPS in RINEX3 NAV
+    'SV_clock_bias','SV_clock_drift','SV_clock_drift_rate',
+    'IODE','Crs','Delta_n','M0',
+    'Cuc','e','Cus','sqrtA','Toe',
+    'Cic','OMEGA0','Cis','i0',
+    'Crc','omega','OMEGADOT','IDOT',
+    'Codes_L2','GPS_week','L2P_flag','SV_accuracy',
+    'SV_health','TGD','IODC','transmission_time',
+    'fit_interval','spare1','spare2','spare3'
+],
+    'J': [  # IRNSS/NavIC – same layout as GPS in RINEX3 NAV
+    'SV_clock_bias','SV_clock_drift','SV_clock_drift_rate',
+    'IODE','Crs','Delta_n','M0',
+    'Cuc','e','Cus','sqrtA','Toe',
+    'Cic','OMEGA0','Cis','i0',
+    'Crc','omega','OMEGADOT','IDOT',
+    'Codes_L2','GPS_week','L2P_flag','SV_accuracy',
+    'SV_health','TGD','IODC','transmission_time',
+    'fit_interval','spare1','spare2','spare3'
+]
 }
 
 def _to_float(s: str) -> float:
@@ -87,44 +146,81 @@ def parse_rinex_nav(path: str):
     """Return {satellite_id: [(epoch_datetime, {param_name: value})]} dict."""
     data = {}
     with open(path, "r") as f:
-        # -------- skip header -------- #
-        for ln in f:
-            if "END OF HEADER" in ln:
-                break
-
         while True:
-            hdr = f.readline()
-            if not hdr:
-                break
-            if not hdr.strip():
-                continue  # ignore blank lines
+            # -------- skip header (initial or intermediate) -------- #
+            header_found = False
+            while True:
+                pos = f.tell()
+                ln = f.readline()
+                if not ln:
+                    break # EOF
+                if "END OF HEADER" in ln:
+                    header_found = True
+                    break
+                # If we see a data line while looking for header end, it means we might have missed the header end or it wasn't there.
+                # But for now, let's assume standard structure: Header -> Data -> (maybe Header -> Data)
+            
+            if not ln and not header_found:
+                 break # EOF reached while looking for header
 
-            # First 22 columns contain PRN & epoch fields
-            parts = hdr[:22].split()
-            sat = parts[0]          # e.g. G01, R06, E12 …
-            yy, mm, dd, hh, mi, ss  = map(int, parts[1:7])
-            epoch = datetime.datetime(yy, mm, dd, hh, mi, ss)
+            # -------- read data block -------- #
+            while True:
+                pos = f.tell()
+                hdr = f.readline()
+                if not hdr:
+                    break
+                if not hdr.strip():
+                    continue
 
-            # Three SV‑clock parameters sit at fixed cols 23‑41, 42‑60, 61‑79
-            clk = [_to_float(hdr[c:c+19]) for c in (23, 42, 61)]
+                # Check for new header start
+                if "RINEX VERSION" in hdr or "PGM / RUN BY / DATE" in hdr:
+                    f.seek(pos) # Backtrack to let the outer loop handle this header
+                    break
+                
+                try:
+                    # First 22 columns contain PRN & epoch fields
+                    parts = hdr[:22].split()
+                    if len(parts) < 7:
+                         # Maybe a header line we missed?
+                         if "RINEX" in hdr or "PGM" in hdr or "IONOSPHERIC" in hdr:
+                             f.seek(pos)
+                             break
+                         continue # Just skip weird short lines
 
-            sys = sat[0]
-            # GLONASS & SBAS have 3 data lines, all others 7
-            extra_lines = 3 if sys in ("R", "S") else 7
-            starts = (4, 23, 42, 61)  # four 19‑char fields per line
+                    sat = parts[0]          # e.g. G01, R06, E12 …
+                    yy, mm, dd, hh, mi, ss  = map(int, parts[1:7])
+                    epoch = datetime.datetime(yy, mm, dd, hh, mi, ss)
+                except ValueError:
+                    # Parsing failed, likely hit a header line
+                    f.seek(pos)
+                    break
 
-            vals = clk
-            for _ in range(extra_lines):
-                line = f.readline()
-                vals.extend(_to_float(line[s:s+19]) for s in starts)
+                # Three SV‑clock parameters sit at fixed cols 23‑41, 42‑60, 61‑79
+                try:
+                    clk = [_to_float(hdr[c:c+19]) for c in (23, 42, 61)]
+                except ValueError:
+                     # Failed to parse clock, treat as end of block
+                     f.seek(pos)
+                     break
 
-            # Map into a name→value dict (pad if spec has fewer names)
-            names = PARAM_MAPS.get(sys, [f"param_{i}" for i in range(len(vals))])
-            if len(names) < len(vals):
-                names += [f"extra_{i}" for i in range(len(vals) - len(names))]
-            params = dict(zip(names, vals))
+                sys = sat[0]
+                # GLONASS & SBAS have 3 data lines, all others 7
+                extra_lines = 3 if sys in ("R", "S") else 7
+                starts = (4, 23, 42, 61)  # four 19‑char fields per line
 
-            data.setdefault(sat, []).append((epoch, params))
+                vals = clk
+                for _ in range(extra_lines):
+                    line = f.readline()
+                    vals.extend(_to_float(line[s:s+19]) for s in starts)
+
+                # Map into a name→value dict (pad if spec has fewer names)
+                names = PARAM_MAPS.get(sys, [f"param_{i}" for i in range(len(vals))])
+                if len(names) < len(vals):
+                    names += [f"extra_{i}" for i in range(len(vals) - len(names))]
+                params = dict(zip(names, vals))
+
+                data.setdefault(sat, []).append((epoch, params))
+                
     return data
 
 def _extract_gz(gz_path: str) -> str:
@@ -137,6 +233,135 @@ def _extract_gz(gz_path: str) -> str:
         with gzip.open(gz_path, 'rb') as g_in, open(out_path, 'wb') as f_out:
             f_out.write(g_in.read())
     return out_path
+
+# ---------------------------------------------------------------------------
+#  RINEX (BRDC) downloader via Earthdata (.netrc or Bearer token)
+# ---------------------------------------------------------------------------
+def _brdc_fname_for_date(day: datetime.date) -> str:
+    y = day.year
+    doy = day.timetuple().tm_yday
+    return f"BRDC00IGS_R_{y}{doy:03d}0000_01D_MN.rnx.gz"
+
+# Build a BRDC filename for a given producer/tag (e.g., IGS/R or DLR/S)
+def _brdc_fname_for_date_product(day: datetime.date, producer: str, tag: str) -> str:
+    y = day.year
+    doy = day.timetuple().tm_yday
+    return f"BRDC00{producer}_{tag}_{y}{doy:03d}0000_01D_MN.rnx.gz"
+
+def download_brdc_for_day(day: datetime.date, out_dir: str = RINEX_DIR, timeout: int = 120) -> str:
+    """Download BRDC NAV for the given day into out_dir using Earthdata auth.
+    Returns the path to the extracted .rnx file (extracts .gz if needed).
+    Uses Bearer token from $EARTHDATA_TOKEN if set; otherwise relies on ~/.netrc.
+    If file already exists locally, it is reused.
+    """
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    fname = _brdc_fname_for_date(day)
+    url = f"https://cddis.nasa.gov/archive/gnss/data/daily/{day.year}/brdc/{fname}"
+    gz_path = str(Path(out_dir) / fname)
+
+    # Reuse if already present
+    if os.path.exists(gz_path):
+        return _extract_gz(gz_path)
+
+    sess = requests.Session()
+    sess.trust_env = True  # allow system certs/proxies
+
+    headers = {}
+    token = os.environ.get('EARTHDATA_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+
+    # First attempt: plain GET (will use .netrc on redirect to urs if needed)
+    resp = sess.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+
+    # If unauthorized and no token, try again explicitly with .netrc creds for URS
+    if resp.status_code in (401, 403) and not token:
+        auth = requests.utils.get_netrc_auth('https://urs.earthdata.nasa.gov')
+        if auth:
+            sess.auth = auth
+            resp = sess.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+
+    resp.raise_for_status()
+    with open(gz_path, 'wb') as f:
+        f.write(resp.content)
+
+    return _extract_gz(gz_path)
+
+
+# Download BRDC with fallback: try multiple producers in order (default: IGS, then DLR)
+def download_brdc_with_fallback(day: datetime.date, out_dir: str = RINEX_DIR,
+                                timeout: int = 45,
+                                products= None) -> str:
+    """Download BRDC NAV for a given day, trying multiple producers in order.
+    Default order: [('IGS','R'), ('DLR','S')]. Returns path to extracted .rnx.
+    Uses EARTHDATA_TOKEN if set, otherwise relies on ~/.netrc automatically.
+    """
+    if products is None:
+        products = [('IGS','R'), ('DLR','S')]
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    sess = requests.Session()
+    sess.trust_env = True
+
+    headers = {}
+    token = os.environ.get('EARTHDATA_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+
+    last_err = None
+
+    for producer, tag in products:
+        fname = _brdc_fname_for_date_product(day, producer, tag)
+        url = f"https://cddis.nasa.gov/archive/gnss/data/daily/{day.year}/brdc/{fname}"
+        gz_path = str(Path(out_dir) / fname)
+        rnx_path = gz_path[:-3]
+
+        # Reuse if already present locally
+        if os.path.exists(rnx_path):
+            return rnx_path
+        if os.path.exists(gz_path):
+            try:
+                return _extract_gz(gz_path)
+            except Exception as e:
+                print(f"[BRDC] Warning: failed to extract existing {gz_path}: {e}")
+                # fall through to re-download
+
+        try:
+            resp = sess.get(url, headers=headers, allow_redirects=True, timeout=(10, timeout))
+            if resp.status_code in (401, 403) and not token:
+                auth = requests.utils.get_netrc_auth('https://urs.earthdata.nasa.gov')
+                if auth:
+                    sess.auth = auth
+                    resp = sess.get(url, headers=headers, allow_redirects=True, timeout=(10, timeout))
+            resp.raise_for_status()
+            with open(gz_path, 'wb') as f:
+                f.write(resp.content)
+            return _extract_gz(gz_path)
+        except Exception as e:
+            print(f"[BRDC] {producer}_{tag} for {day} not available: {e}")
+            last_err = e
+            continue
+
+    raise last_err if last_err else RuntimeError(f"No BRDC product available for {day}")
+
+# Try to ensure a recent BRDC exists locally: today, yesterday, ... (tries up to max_days_back days, stops at first success)
+def ensure_latest_brdc(max_days_back: int = 2, out_dir: str = RINEX_DIR) -> list[str]:
+    """Ensure a recent BRDC exists locally by trying today, then 1–2 days back.
+    Stops on the first successful download/extract and returns [path].
+    Raises if none were found.
+    """
+    today = datetime.date.today()
+    for i in range(max_days_back + 1):
+        day = today - datetime.timedelta(days=i)
+        try:
+            path_rnx = download_brdc_with_fallback(day, out_dir=out_dir, timeout=45)
+            print(f"[BRDC] using {Path(path_rnx).name} ({day})")
+            return [path_rnx]
+        except Exception as e:
+            print(f"[BRDC] Warning: could not fetch any BRDC for {day} → {e}")
+            continue
+    raise FileNotFoundError(f"No recent BRDC found (today/back {max_days_back} days)")
 
 def load_rinex_dir(dir_path: str) -> dict:
     """
@@ -411,8 +636,8 @@ def _ecef_to_eci(epoch_utc: datetime.datetime, x_ecef, y_ecef, z_ecef,
     y_eci =  s*x_ecef + c*y_ecef
     z_eci =  z_ecef
 
-    if vx_ecef == vy_ecef == vz_ecef == 0.0:
-        return (x_eci, y_eci, z_eci)           # רק מיקום
+    # if vx_ecef == vy_ecef == vz_ecef == 0.0:
+    #     return (x_eci, y_eci, z_eci)           # רק מיקום
 
     # מהירות (R·v + ω×r)
     vx_rot = c*vx_ecef - s*vy_ecef
@@ -474,20 +699,19 @@ def acceleration_j2(r: tuple[float, float, float]) -> tuple[float, float, float]
 
     return ax, ay, az
 
+@lru_cache(maxsize=200000)
 def sun_position_eci(epoch: datetime.datetime) -> tuple[float, float, float]:
     """ECI Sun vector *Earth-centred* (Skyfield • מדויק ~1 m)."""
-    t = _ts.utc(epoch.year, epoch.month, epoch.day,
-                epoch.hour, epoch.minute, epoch.second + epoch.microsecond/1e6)
-    # Sun w.r.t. Earth
-    pos = ( _eph['sun'].at(t) - earth.at(t) ).position.m  # ← יחידות [m]
-    return tuple(pos)
+    t = _skyfield_time(epoch)
+    pos = (_sun.at(t) - earth.at(t)).position.m  # numpy array
+    return (float(pos[0]), float(pos[1]), float(pos[2]))
 
+@lru_cache(maxsize=200000)
 def moon_position_eci(epoch: datetime.datetime) -> tuple[float, float, float]:
     """ECI Moon vector *Earth-centred* (Skyfield)."""
-    t = _ts.utc(epoch.year, epoch.month, epoch.day,
-                epoch.hour, epoch.minute, epoch.second + epoch.microsecond/1e6)
-    pos = ( _eph['moon'].at(t) - earth.at(t) ).position.m
-    return tuple(pos)
+    t = _skyfield_time(epoch)
+    pos = (_moon.at(t) - earth.at(t)).position.m
+    return (float(pos[0]), float(pos[1]), float(pos[2]))
 
 
 # ---------------------------------------------------------------------------
@@ -685,14 +909,42 @@ FORCES = {
 def acceleration_total(r, epoch, active=None):
     """
     מחזיר Σ תאוצות עבור הכוחות ב-active.
-    active=None  →  כל הכוחות ברשימה.
+    מחשב וקטורי Sun/Moon פעם אחת לכל קריאה ומשתמש בהם גם ל-SRP,
+    כדי להימנע מכפל קריאות לאפמריס. התוצאה הנומרית זהה לחלוטין.
     """
     if active is None:
         active = FORCES.keys()
+    # normalize active to a list (may be dict_keys)
+    if not isinstance(active, (list, tuple)):
+        active = list(active)
+
+    # Precompute third-body vectors if needed
+    r_sun = r_moon = None
+    needs_sun = ('Sun' in active) or ('SRP' in active)
+    if needs_sun:
+        r_sun = sun_position_eci(epoch)
+    if 'Moon' in active:
+        r_moon = moon_position_eci(epoch)
 
     ax = ay = az = 0.0
     for key in active:
-        ai = FORCES[key](r, epoch)
+        if key == 'central':
+            ai = accel_central(r)
+        elif key == 'J2':
+            ai = accel_J2(r)
+        elif key == 'J3':
+            ai = accel_J3(r)
+        elif key == 'J4':
+            ai = accel_J4(r)
+        elif key == 'Sun':
+            ai = acceleration_third_body(r, r_sun, GM_SUN)
+        elif key == 'Moon':
+            ai = acceleration_third_body(r, r_moon, GM_MOON)
+        elif key == 'SRP':
+            ai = acceleration_srp(r, r_sun)
+        else:
+            # fallback to mapping for any custom force
+            ai = FORCES[key](r, epoch)
         ax += ai[0]; ay += ai[1]; az += ai[2]
     return ax, ay, az
 
@@ -826,18 +1078,12 @@ def main_():
         print(f"{forces_str:<45} →  error = {err:10.2f} m")
 
 
-# ---------- Run the parser ---------- #
-records = load_rinex_dir(RINEX_DIR)
-satellites = {sid: Satellite(sid, recs) for sid, recs in records.items()}
-
-
 def run_propagation_tests(
         sat_name: str = "G01",
         epoch0_index: int = 0,
         delta_minutes_list: tuple[int, ...] = (60, 180, 540, 1080, 2160),
         step_seconds: float = 60.0,
-        force_sets = None,
-):
+        force_sets = None):
     """
     הדפסת שגיאת קידום עבור לווין אחד, למבחר מרווחי זמן ולכמה קבוצות כוחות.
 
@@ -872,7 +1118,6 @@ def run_propagation_tests(
     print(f"\n=== Propagation tests for {sat_name} – start @ {epoch0} ===\n")
 
     # ---- iterate over requested Δt's ----
-    from datetime import timedelta
     for dmin in delta_minutes_list:
         epoch_target = epoch0 + timedelta(minutes=dmin)
 
@@ -889,15 +1134,917 @@ def run_propagation_tests(
                                       step=step_seconds, forces=forces)
             err_m = math.dist(r_pred, r_true)
             print(f"  {', '.join(forces):<40} →  {err_m:9.2f} m")
-        print()
+            print()
+class SkyImage:
+     """
+     אובייקט שמרכז את כל הלוויינים (מתוך records/satellites), מאפשר
+     לקדם את כל תמונת השמיים קדימה בזמן באמצעות מודל הכוחות הקיים (J2–J4),
+     ולשמור תחזיות (predictions) לשימוש מאוחר יותר (כתיבת RINEX בשלב ב').
+
+     שימוש טיפוסי:
+         sky = SkyImage.from_rinex_dir(RINEX_DIR)
+         sky.propagate_all(days=2.0, output_every_minutes=120,
+                           step_seconds=60.0,
+                           forces=['central','J2','J3','J4'])
+         preds = sky.get_predictions('G01')
+     """
+
+     def __init__(self, satellites_dict: dict[str, Satellite]):
+         self.satellites: dict[str, Satellite] = satellites_dict
+         # predictions: {sat_id: [(epoch, (x,y,z,vx,vy,vz)), ...]}
+         self.predictions: dict[str, list[tuple[datetime.datetime, tuple[float,float,float,float,float,float]]]] = {}
+         # per-satellite along-track calibration (delta-v)
+         self.calibration_dv: dict[str, float] = {}
+     def calibrate_and_forecast(self,
+                                days_ahead: float,
+                                output_every_minutes: int = 120,
+                                step_seconds: float = 60.0,
+                                forces = None,
+                                sat_filter = None,
+                                cal_bounds: tuple[float, float] = (-0.1, 0.1),
+                                cal_tol: float = 1e-4,
+                                cal_max_iter: int = 60,
+                                verbose: bool = True) -> pd.DataFrame:
+         """
+         Calibrate an along‑track δv per satellite using *past* arc (first→last
+         broadcast epoch), then forecast **forward** from the last epoch by
+         `days_ahead`, storing predictions in `self.predictions` and returning a
+         summary DataFrame with the calibration used.
+         """
+         if forces is None:
+             forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+         ids = self.list_satellites()
+         if sat_filter:
+             ids = [sid for sid in ids if sid in sat_filter]
+         if not ids:
+             return pd.DataFrame(columns=['sat','dv_t_mps','rmse_m','n_epochs','last_epoch','forecast_until'])
+
+         # clear previous
+         self.predictions.clear()
+         self.calibration_dv = {}
+
+         total_minutes = int(round(days_ahead * 24 * 60))
+         if total_minutes <= 0:
+             raise ValueError("days_ahead must be positive")
+         step_out = max(1, abs(int(output_every_minutes)))
+
+         rows = []
+         for sid in ids:
+             sat = self.satellites[sid]
+             entries = sat.entries
+             if len(entries) < 2:
+                 continue
+
+             if verbose:
+                 print(f"[cal+fc] {sid}: calibrating on {len(entries)} epochs (first→last)...")
+             dv_opt, rmse_opt = calibrate_alongtrack_dv(
+                 sat, start_index=0, forces=forces, step_seconds=step_seconds,
+                 bounds=cal_bounds, tol=cal_tol, max_iter=cal_max_iter, verbose=False)
+             self.calibration_dv[sid] = dv_opt
+
+             last_idx = len(entries) - 1
+             epoch0 = entries[last_idx][0]
+             x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, last_idx)
+             r = (x0, y0, z0)
+             v = (vx0, vy0, vz0)
+             if dv_opt != 0.0:
+                 v = _apply_alongtrack_delta_v(v, dv_opt)
+
+             if verbose:
+                 until = epoch0 + datetime.timedelta(minutes=total_minutes)
+                 print(f"[cal+fc] {sid}: dv_t*={dv_opt:.6f} m/s, rmse={rmse_opt:.2f} m → forecasting to {until}")
+
+             # forward propagate on a uniform output grid
+             pred_list: list[tuple[datetime.datetime, tuple[float,...]] ] = []
+             current_epoch = epoch0
+             remaining = total_minutes
+             while remaining > 0:
+                 jump = min(step_out, remaining)
+                 next_epoch = current_epoch + datetime.timedelta(minutes=jump)
+                 r, v = propagate_rk4(r, v, current_epoch, next_epoch,
+                                      step=step_seconds, forces=forces)
+                 pred_list.append((next_epoch, (*r, *v)))
+                 current_epoch = next_epoch
+                 remaining -= jump
+
+             self.predictions[sid] = pred_list
+
+             rows.append({
+                 'sat': sid,
+                 'dv_t_mps': dv_opt,
+                 'rmse_m': rmse_opt,
+                 'n_epochs': len(entries),
+                 'last_epoch': epoch0,
+                 'forecast_until': pred_list[-1][0] if pred_list else epoch0,
+             })
+
+         return pd.DataFrame(rows)
+
+     # ------------ מפעלים -------------------------------------------------
+     @classmethod
+     def from_rinex_dir(cls, dir_path: str = RINEX_DIR) -> 'SkyImage':
+         recs = load_rinex_dir(dir_path)
+         sats = {sid: Satellite(sid, ent) for sid, ent in recs.items()}
+         return cls(sats)
+
+     @classmethod
+     def from_existing_satellites(cls, sats: dict[str, Satellite]) -> 'SkyImage':
+         return cls(sats)
+
+     # ------------ שירותים ------------------------------------------------
+     def list_satellites(self, constellation = None) -> list[str]:
+         """החזר רשימת מזהי-לוויינים, אופציונלית מסוננת לפי קונסטלציה ('G','R','E','C',...)."""
+         ids = list(self.satellites.keys())
+         if constellation:
+             ids = [sid for sid in ids if sid.startswith(constellation)]
+         return sorted(ids)
+
+     def clear_predictions(self):
+         self.predictions.clear()
+
+     def get_predictions(self, sat_id: str) -> list[tuple[datetime.datetime, tuple[float,...]]]:
+         return self.predictions.get(sat_id, [])
+
+     # ------------ קידום כללי --------------------------------------------
+     def propagate_all(self,
+                       days: float,
+                       output_every_minutes: int = 120,
+                       step_seconds: float = 60.0,
+                       forces = ['central', 'J2', 'J3', 'J4', "Sun", "Moon", "SRP"],
+                       start_epoch_policy: str = 'last',
+                       sat_filter= None) -> None:
+         """
+         קדם את כל הלוויינים בבת־אחת ב־RK4, ושמור תחזיות בדגימה אחידה.
+
+         Parameters
+         ----------
+         days : float
+             בכמה ימים לקדם קדימה (יכול להיות שלילי לקידום אחורה).
+         output_every_minutes : int
+             מרווח הדגימה של נקודות התחזית לשמירה (ל־RINEX עתידי).
+         step_seconds : float
+             צעד RK4 פנימי.
+         forces : list[str]
+             קבוצת כוחות להפעלה. None ⇒ ['central','J2','J3','J4'].
+         start_epoch_policy : {'last','first','index:<n>'}
+             מאיזה epoch להתחיל לכל לוויין.
+         sat_filter : list[str] | None
+             אם ניתן – יריץ רק עבור מזהים אלו.
+         """
+         if forces is None:
+             forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+         ids = self.list_satellites()
+         if sat_filter:
+             ids = [sid for sid in ids if sid in sat_filter]
+
+         self.predictions.clear()
+
+         for sid in ids:
+             sat = self.satellites[sid]
+             print(f"Currently Propagating SV {sat.id}")
+             epochs = sat.epochs()
+             if not epochs:
+                 continue
+
+             # בוחרים epoch התחלה לפי המדיניות
+             if start_epoch_policy == 'last':
+                 idx0 = len(epochs) - 1
+             elif start_epoch_policy == 'first':
+                 idx0 = 0
+             elif start_epoch_policy.startswith('index:'):
+                 try:
+                     idx0 = int(start_epoch_policy.split(':',1)[1])
+                 except Exception:
+                     idx0 = 0
+                 idx0 = max(0, min(idx0, len(epochs)-1))
+             else:
+                 idx0 = len(epochs) - 1
+
+             epoch0 = epochs[idx0]
+             x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, idx0)
+             r, v = (x0, y0, z0), (vx0, vy0, vz0)
+
+             # גריד יציאה
+             total_minutes = int(round(days * 24 * 60))
+             sign = 1 if total_minutes >= 0 else -1
+             total_minutes = abs(total_minutes)
+             if total_minutes == 0:
+                 # רק נקודת התחלה
+                 self.predictions[sid] = [(epoch0, (x0,y0,z0,vx0,vy0,vz0))]
+                 continue
+
+             step_out = abs(int(output_every_minutes))
+             step_out = max(1, step_out)
+
+             # ננוע קדימה/אחורה במקטעים של output_every_minutes
+             pred_list: list[tuple[datetime.datetime, tuple[float,...]]] = []
+             current_epoch = epoch0
+             remaining = total_minutes
+             while remaining > 0:
+                 # זמן היעד הבא לגריד
+                 jump = min(step_out, remaining)
+                 next_epoch = current_epoch + datetime.timedelta(minutes=sign*jump)
+                 # קידום של מצב r,v עד ל-next_epoch
+                 r, v = propagate_rk4(r, v, current_epoch, next_epoch,
+                                      step=step_seconds, forces=forces)
+                 pred_list.append((next_epoch, (*r, *v)))
+                 current_epoch = next_epoch
+                 remaining -= jump
+
+             self.predictions[sid] = pred_list
+
+    # ------------ כתיבת RINEX – שלב ב' ---------------------------
+     def write_rinex(self, out_path: str, version: str = '3.04') -> None:
+         """
+         Write a RINEX Navigation file with the predictions stored in `self.predictions`.
+         Converts Cartesian state (ECI) to Keplerian elements for GPS/Galileo/BeiDou.
+         """
+         if not self.predictions:
+             print("No predictions to write.")
+             return
+
+         # Collect all epochs and satellites
+         all_epochs = set()
+         for pred_list in self.predictions.values():
+             for epoch, _ in pred_list:
+                 all_epochs.add(epoch)
+         sorted_epochs = sorted(list(all_epochs))
+
+         with open(out_path, 'w') as f:
+             # Header
+             f.write(f"{version:>9}           N: GNSS NAV DATA    M: MIXED            RINEX VERSION / TYPE\n")
+             f.write(f"EphemerisProp       Generated by Python 20251204 000000 GMT PGM / RUN BY / DATE\n")
+             f.write(f"{'':60}END OF HEADER\n")
+
+             # Data
+             for epoch in sorted_epochs:
+                 for sid, pred_list in self.predictions.items():
+                     # Find state for this epoch
+                     state = next((s for t, s in pred_list if t == epoch), None)
+                     if not state:
+                         continue
+                     
+                     x, y, z, vx, vy, vz = state
+                     r_vec = (x, y, z)
+                     v_vec = (vx, vy, vz)
+                     
+                     # Convert to Keplerian (approximate for broadcast)
+                     # Note: Broadcast usually uses Mean elements, here we use Osculating.
+                     # Also, broadcast parameters are in ECEF frame usually (for the orbit), 
+                     # but our propagation is in ECI. 
+                     # However, standard RINEX broadcast parameters define the orbit in ECEF (rotating).
+                     # Wait, GPS broadcast parameters (Keplerian) define the orbit in an INERTIAL frame 
+                     # (relative to Ω0 at Toe), but the coordinate system rotates with Earth?
+                     # Actually, the ICD defines the coordinate system.
+                     # For simplicity, we will output a "GLONASS-like" Cartesian record if possible, 
+                     # OR we try to fit Keplerian.
+                     # Given the complexity, and the user's request "give a file containing up to the requested time",
+                     # maybe they just want the *original* RINEX extended?
+                     # But we are propagating.
+                     
+                     # Let's try to write a simplified GPS record with fitted elements.
+                     # Or better: write Cartesian state if the format allows (RINEX 3.04 supports it for GLONASS/SBAS/BDS).
+                     # For GPS, it MUST be Keplerian.
+                     
+                     # Implementation of Cartesian -> Keplerian
+                     try:
+                         a, e, i, Omega, omega, M, n = _cartesian_to_keplerian(r_vec, v_vec)
+                     except Exception:
+                         continue # Skip if conversion fails (e.g. hyperbolic)
+
+                     # We need to fill the RINEX record.
+                     # GPS Record Layout (RINEX 3.04):
+                     # Line 1: SV, Epoch, SV Clock Bias, SV Clock Drift, SV Clock Drift Rate
+                     # Line 2: IODE, Crs, Delta n, M0
+                     # Line 3: Cuc, e, Cus, sqrt(A)
+                     # Line 4: Toe, Cic, Omega0, Cis
+                     # Line 5: i0, Crc, omega, OmegaDot
+                     # Line 6: IDOT, Codes on L2, GPS Week, L2 P data flag
+                     # Line 7: SV accuracy, SV health, TGD, IODC
+                     # Line 8: Transmission time, Fit interval, spare, spare
+                     
+                     # We don't have clock data, so we set to 0.
+                     # We don't have perturbations (Crs, Cuc, etc.), set to 0.
+                     # We set Toe = epoch.
+                     
+                     # Time handling
+                     y, m, d, h, min_, sec = epoch.year, epoch.month, epoch.day, epoch.hour, epoch.minute, epoch.second
+                     
+                     # GPS Week and Toe
+                     # Simple approx:
+                     diff = epoch - datetime.datetime(1980, 1, 6)
+                     gps_week = diff.days // 7
+                     toe = diff.total_seconds() - gps_week * 604800
+                     
+                     # Format floats
+                     def fmt(val):
+                         return f"{val:19.12E}".replace('E', 'D')
+
+                     # Line 1
+                     f.write(f"{sid} {y:04} {m:02} {d:02} {h:02} {min_:02} {sec:02} {fmt(0)} {fmt(0)} {fmt(0)}\n")
+                     
+                     # Line 2: IODE, Crs, Delta n, M0
+                     f.write(f"    {fmt(0)}{fmt(0)}{fmt(0)}{fmt(M)}\n")
+                     
+                     # Line 3: Cuc, e, Cus, sqrt(A)
+                     f.write(f"    {fmt(0)}{fmt(e)}{fmt(0)}{fmt(math.sqrt(a))}\n")
+                     
+                     # Line 4: Toe, Cic, Omega0, Cis
+                     # Note: Omega0 in RINEX is relative to Greenwich at start of week? 
+                     # Actually it is RAAN at Weekly Epoch.
+                     # Our Omega is RAAN in ECI (J2000).
+                     # We need to adjust for GST to get "Longitude of Ascending Node" in ECEF at Toe?
+                     # GPS ICD: Ωk = Ω0 + (Ωdot - ωe)*tk - ωe*Toe
+                     # Here we have instantaneous Ω (RAAN).
+                     # Let's assume Omega0 = Omega - (OmegaDot - OMEGA_E)*tk + OMEGA_E*Toe?
+                     # At tk=0 (epoch=Toe), Ω = Ω0 - ωe*Toe.
+                     # So Ω0 = Ω + ωe*Toe.
+                     # Wait, Ω in ECI is inertial.
+                     # The formula for longitude of ascending node is Ω(t) = Ω0 + (Ωdot - ωe)*tk - ωe*Toe.
+                     # At t=Toe (tk=0), Ω(Toe) = Ω0 - ωe*Toe.
+                     # So Ω0 = Ω(Toe) + ωe*Toe.
+                     # But Ω(Toe) is the RAAN in ECI? Yes.
+                     # And we need to subtract GMST?
+                     # Actually, let's just use the standard conversion:
+                     # Ω0 = Ω_ECI - GMST(Toe) ? No, GPS uses a specific frame.
+                     # Let's use Ω0 = Ω_ECI + OMEGA_E * Toe (approx).
+                     
+                     omega0 = Omega + OMEGA_E * toe
+                     
+                     f.write(f"    {fmt(toe)}{fmt(0)}{fmt(omega0)}{fmt(0)}\n")
+                     
+                     # Line 5: i0, Crc, omega, OmegaDot
+                     f.write(f"    {fmt(i)}{fmt(0)}{fmt(omega)}{fmt(0)}\n")
+                     
+                     # Line 6: IDOT, Codes, Week, Flag
+                     f.write(f"    {fmt(0)}{fmt(0)}{fmt(gps_week)}{fmt(0)}\n")
+                     
+                     # Line 7: Acc, Health, TGD, IODC
+                     f.write(f"    {fmt(0)}{fmt(0)}{fmt(0)}{fmt(0)}\n")
+                     
+                     # Line 8: TransTime, Fit, Spare, Spare
+                     f.write(f"    {fmt(0)}{fmt(0)}{fmt(0)}{fmt(0)}\n")
+
+def _cartesian_to_keplerian(r_vec, v_vec):
+    """
+    Convert ECI Cartesian state (position r, velocity v) to Keplerian elements.
+    r, v in meters and meters/second.
+    Returns: a, e, i, Omega, omega, M, n
+    """
+    x, y, z = r_vec
+    vx, vy, vz = v_vec
+    
+    r = math.sqrt(x*x + y*y + z*z)
+    v2 = vx*vx + vy*vy + vz*vz
+    
+    # Specific angular momentum h = r x v
+    hx = y*vz - z*vy
+    hy = z*vx - x*vz
+    hz = x*vy - y*vx
+    h = math.sqrt(hx*hx + hy*hy + hz*hz)
+    
+    # Inclination i
+    i = math.acos(hz / h)
+    
+    # Right Ascension of Ascending Node Omega
+    # Node vector n = k x h = (-hy, hx, 0)
+    nx, ny = -hy, hx
+    n_mag = math.sqrt(nx*nx + ny*ny)
+    
+    if n_mag < 1e-9:
+        Omega = 0.0 # Equatorial orbit
+    else:
+        Omega = math.atan2(ny, nx)
+        if Omega < 0: Omega += 2*math.pi
+        
+    # Eccentricity vector e
+    # e = (1/MU) * ((v^2 - MU/r)*r - (r.v)*v)
+    mu_r = MU / r
+    rv = x*vx + y*vy + z*vz
+    
+    ex = (1/MU) * ((v2 - mu_r)*x - rv*vx)
+    ey = (1/MU) * ((v2 - mu_r)*y - rv*vy)
+    ez = (1/MU) * ((v2 - mu_r)*z - rv*vz)
+    e = math.sqrt(ex*ex + ey*ey + ez*ez)
+    
+    # Semi-major axis a
+    # Energy E = v^2/2 - MU/r = -MU / (2a)
+    energy = v2/2 - mu_r
+    if abs(energy) < 1e-9:
+        a = float('inf') # Parabolic
+    else:
+        a = -MU / (2*energy)
+        
+    # Argument of Perigee omega
+    if n_mag < 1e-9:
+        # Equatorial: angle between e and x-axis?
+        omega = 0.0 # Undefined
+    else:
+        # Angle between n and e
+        # cos(w) = n.e / (|n||e|)
+        ndote = nx*ex + ny*ey # nz=0
+        cos_w = ndote / (n_mag * e)
+        cos_w = max(-1.0, min(1.0, cos_w))
+        omega = math.acos(cos_w)
+        if ez < 0:
+            omega = 2*math.pi - omega
+            
+    # Mean Anomaly M
+    # True Anomaly nu: angle between e and r
+    edotr = ex*x + ey*y + ez*z
+    cos_nu = edotr / (e * r)
+    cos_nu = max(-1.0, min(1.0, cos_nu))
+    nu = math.acos(cos_nu)
+    if rv < 0:
+        nu = 2*math.pi - nu
+        
+    # Eccentric Anomaly E
+    # tan(E/2) = sqrt((1-e)/(1+e)) * tan(nu/2)
+    E = 2 * math.atan(math.sqrt((1-e)/(1+e)) * math.tan(nu/2))
+    if E < 0: E += 2*math.pi
+    
+    # Mean Anomaly M = E - e*sin(E)
+    M = E - e*math.sin(E)
+    
+    # Mean motion n
+    n = math.sqrt(MU / a**3)
+    
+    return a, e, i, Omega, omega, M, n
+
+# ---------------------------------------------------------------------------
+#  📊 Propagation test across satellites – mean & std of position error vs time
+# ---------------------------------------------------------------------------
+def test_propagation_errors(
+        satellites_dict: dict,
+        forces = ['central', 'J2', 'J3', 'J4', "Sun", "Moon", "SRP"],
+        step_seconds: float = 60.0,
+        constellation = 'G',
+        show_plot: bool = True,
+        verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    עבור כל לווין: מקדם מה-epoch הראשון → לכל epoch עד האחרון (ברצף),
+    מחשב בכל שלב את שגיאת המיקום (ECI), ומאגד ממוצע+סטיית-תקן על פני כל הלוויינים
+    כפונקציה של Δt (בדקות) מאז ה-epoch הראשון של אותו לווין.
+
+    Parameters
+    ----------
+    satellites_dict : dict[str, Satellite]
+        מילון הלוויינים הקיים (`satellites`).
+    forces : list[str] | None
+        רשימת כוחות ל-RK4. None ⇒ ['central','J2','J3','J4'].
+    step_seconds : float
+        צעד RK4 פנימי [s].
+    constellation : str | None
+        אם לא-None, מסנן לוויינים לפי התחילית ('G','E','C','R','S', ...).
+    show_plot : bool
+        האם להציג תרשים עם ממוצע וסטיית-תקן מול זמן.
+    verbose : bool
+        האם להדפיס התקדמות.
+
+    Returns
+    -------
+    pd.DataFrame
+        טבלת תקציר עם עמודות: ['dt_min','mean_m','std_m','n'].
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+    # בחירת הלוויינים
+    sat_ids = sorted(satellites_dict.keys())
+    if constellation:
+        sat_ids = [sid for sid in sat_ids if sid.startswith(constellation)]
+    if not sat_ids:
+        raise ValueError("No satellites selected – check constellation filter.")
+
+    # יצבור טעויות לפי דלתא-זמן (בדקות) מאז epoch ראשון של כל לווין
+    errors_by_dt = defaultdict(list)  # {dt_min: [err_m over sats that have this dt]}
+
+    for sid in sat_ids:
+        sat = satellites_dict[sid]
+        entries = sat.entries
+        if len(entries) < 2:
+            continue
+        if verbose:
+            print(f"[test] {sid}: {len(entries)} epochs")
+
+        # מצב התחלתי
+        epoch0 = entries[0][0]
+        x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, 0)
+        r, v = (x0, y0, z0), (vx0, vy0, vz0)
+        t_cur = epoch0
+
+        # קדימה עד סוף הרשומות, תוך בדיקה בכל אפוק אמת
+        for k in range(1, len(entries)):
+            epoch_k = entries[k][0]
+            # קידום רציף מהמצב הנוכחי אל האפוק הבא
+            r, v = propagate_rk4(r, v, t_cur, epoch_k, step=step_seconds, forces=forces)
+            t_cur = epoch_k
+
+            # אמת מן ה-broadcast
+            x_t, y_t, z_t, *_ = sat_state_eci(sat, k)
+            # שגיאת מיקום [m]
+            err = math.sqrt((r[0]-x_t)**2 + (r[1]-y_t)**2 + (r[2]-z_t)**2)
+
+            dt_min = int(round((epoch_k - epoch0).total_seconds() / 60.0))
+            errors_by_dt[dt_min].append(err)
+
+    if not errors_by_dt:
+        raise RuntimeError("No error data accumulated – check inputs.")
+
+    # בניית תקציר: dt → mean/std/n
+    dts = sorted(errors_by_dt.keys())
+    means = []
+    stds = []
+    counts = []
+    for dt in dts:
+        vals = errors_by_dt[dt]
+        counts.append(len(vals))
+        means.append(stats.fmean(vals))
+        stds.append(stats.stdev(vals) if len(vals) > 1 else 0.0)
+
+    summary = pd.DataFrame({
+        'dt_min': dts,
+        'mean_m': means,
+        'std_m': stds,
+        'n': counts,
+    })
+
+    if show_plot:
+        plt.figure()
+        plt.plot(summary['dt_min'], summary['mean_m'], label='Mean position error [m]')
+        lower = [m - s for m, s in zip(summary['mean_m'], summary['std_m'])]
+        upper = [m + s for m, s in zip(summary['mean_m'], summary['std_m'])]
+        plt.fill_between(summary['dt_min'], lower, upper, alpha=0.2, label='± Standard deviation')
+        plt.xlabel('Δt since first epoch [minutes]')
+        plt.ylabel('Position error [m]')
+        plt.title('Propagation error – mean and std across satellites')
+        plt.grid(True, which='both', alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return summary
+
+# ---------------------------------------------------------------------------
+#  ⚙️ Calibration utilities – remove along‑track bias by fitting δvₜ at t₀
+# ---------------------------------------------------------------------------
+
+def _apply_alongtrack_delta_v(v0: tuple[float, float, float], dv_t: float) -> tuple[float, float, float]:
+    """Return v0 with an added along‑track (tangential) delta‑v of dv_t [m/s]."""
+    vx, vy, vz = v0
+    vnorm = math.sqrt(vx*vx + vy*vy + vz*vz)
+    if vnorm == 0.0:
+        return v0
+    tx, ty, tz = vx/vnorm, vy/vnorm, vz/vnorm  # unit tangent (velocity) direction
+    return (vx + dv_t*tx, vy + dv_t*ty, vz + dv_t*tz)
+
+
+def _propagation_error_series(sat: 'Satellite', start_index: int,
+                              forces=None, step_seconds: float = 60.0,
+                              dv_t: float = 0.0) -> list[float]:
+    """
+    Propagate from entries[start_index] to the end, returning per‑epoch 3D position
+    errors [m] against broadcast ephemeris. Optionally apply an initial along‑track
+    delta‑v dv_t [m/s].
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+    entries = sat.entries
+    if start_index >= len(entries) - 1:
+        return []
+
+    epoch0 = entries[start_index][0]
+    x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, start_index)
+    v0 = (vx0, vy0, vz0)
+    if dv_t != 0.0:
+        v0 = _apply_alongtrack_delta_v(v0, dv_t)
+    r = (x0, y0, z0)
+    v = v0
+    t_cur = epoch0
+
+    errs: list[float] = []
+    for k in range(start_index+1, len(entries)):
+        epoch_k = entries[k][0]
+        r, v = propagate_rk4(r, v, t_cur, epoch_k, step=step_seconds, forces=forces)
+        t_cur = epoch_k
+        x_t, y_t, z_t, *_ = sat_state_eci(sat, k)
+        err = math.sqrt((r[0]-x_t)**2 + (r[1]-y_t)**2 + (r[2]-z_t)**2)
+        errs.append(err)
+    return errs
+
+
+def _rms(values: list[float]) -> float:
+    return math.sqrt(sum(v*v for v in values) / len(values)) if values else float('nan')
+
+
+def calibrate_alongtrack_dv(sat: 'Satellite', start_index: int = 0,
+                             forces=None, step_seconds: float = 60.0,
+                             bounds: tuple[float, float] = (-0.2, 0.2),
+                             tol: float = 1e-4, max_iter: int = 60,
+                             verbose: bool = True) -> tuple[float, float]:
+    """
+    Find the along‑track delta‑v at t₀ (in m/s) that minimizes the RMS 3D position
+    error over the arc (from entries[start_index] to the last entry).
+
+    Returns
+    -------
+    (dv_t_opt [m/s], rmse_opt [m])
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+    # Golden‑section search over dv_t in [a,b]
+    a, b = bounds
+    phi = (math.sqrt(5.0) - 1.0) / 2.0  # ~0.618
+    c = b - phi*(b - a)
+    d = a + phi*(b - a)
+
+    def f(dv: float) -> float:
+        errs = _propagation_error_series(sat, start_index, forces, step_seconds, dv_t=dv)
+        return _rms(errs)
+
+    fc = f(c)
+    fd = f(d)
+    it = 0
+    while (b - a) > tol and it < max_iter:
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - phi*(b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + phi*(b - a)
+            fd = f(d)
+        it += 1
+        if verbose:
+            print(f"[cal] iter {it:02d}: interval=({a:.6f},{b:.6f})  best≈{min(fc,fd):.3f} m")
+
+    dv_opt = (a + b) / 2.0
+    rmse_opt = f(dv_opt)
+    if verbose:
+        print(f"[cal] dv_t* = {dv_opt:.6f} m/s,  RMSE = {rmse_opt:.3f} m")
+    return dv_opt, rmse_opt
+
+
+def calibrate_dv_for_all(satellites_dict: dict, constellation: str = 'G',
+                         forces=None, step_seconds: float = 60.0,
+                         **kwargs) -> pd.DataFrame:
+    """
+    Calibrate dv_t per‑satellite (first→last epoch) and return a summary DataFrame
+    with columns: ['sat','dv_t_mps','rmse_m','n_epochs'].
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+    sat_ids = sorted(satellites_dict.keys())
+    if constellation:
+        sat_ids = [sid for sid in sat_ids if sid.startswith(constellation)]
+    rows = []
+    for sid in sat_ids:
+        sat = satellites_dict[sid]
+        if len(sat.entries) < 2:
+            continue
+        dv_opt, rmse_opt = calibrate_alongtrack_dv(sat, start_index=0, forces=forces,
+                                                   step_seconds=step_seconds, verbose=False, **kwargs)
+        rows.append({'sat': sid, 'dv_t_mps': dv_opt, 'rmse_m': rmse_opt, 'n_epochs': len(sat.entries)})
+        print(f"[cal] {sid}: dv_t={dv_opt:.6f} m/s, rmse={rmse_opt:.2f} m, N={len(sat.entries)}")
+    return pd.DataFrame(rows)
+
+# ---------------------------------------------------------------------------
+#  📐 Calibrate on day‑1, evaluate on the remaining days – per satellite & aggregate
+# ---------------------------------------------------------------------------
+
+def _first_day_end_index(entries: list[tuple[datetime.datetime, dict]]) -> int:
+    """Return the last index belonging to the first 24h window since entries[0]."""
+    if not entries:
+        return -1
+    t0 = entries[0][0]
+    t_end = t0 + datetime.timedelta(days=1)
+    idx_end = 0
+    for i, (t, _) in enumerate(entries):
+        if t < t_end:
+            idx_end = i
+        else:
+            break
+    return idx_end
+
+
+def _propagation_error_series_range(sat: 'Satellite', start_index: int, end_index: int,
+                                    forces=None, step_seconds: float = 60.0,
+                                    dv_t: float = 0.0) -> list[float]:
+    """
+    Propagate from entries[start_index] up to entries[end_index], returning per‑epoch
+    3D position errors [m] against broadcast. Optionally apply an initial along‑track
+    delta‑v dv_t [m/s] at entries[start_index].
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4']
+
+    entries = sat.entries
+    if start_index >= end_index:
+        return []
+
+    epoch0 = entries[start_index][0]
+    x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, start_index)
+    v0 = (vx0, vy0, vz0)
+    if dv_t != 0.0:
+        v0 = _apply_alongtrack_delta_v(v0, dv_t)
+    r = (x0, y0, z0)
+    v = v0
+    t_cur = epoch0
+
+    errs: list[float] = []
+    for k in range(start_index+1, end_index+1):
+        epoch_k = entries[k][0]
+        r, v = propagate_rk4(r, v, t_cur, epoch_k, step=step_seconds, forces=forces)
+        t_cur = epoch_k
+        x_t, y_t, z_t, *_ = sat_state_eci(sat, k)
+        err = math.sqrt((r[0]-x_t)**2 + (r[1]-y_t)**2 + (r[2]-z_t)**2)
+        errs.append(err)
+    return errs
+
+
+def calibrate_alongtrack_dv_on_range(sat: 'Satellite', start_index: int, end_index: int,
+                                      forces=None, step_seconds: float = 60.0,
+                                      bounds: tuple[float, float] = (-0.2, 0.2),
+                                      tol: float = 1e-4, max_iter: int = 60,
+                                      verbose: bool = False) -> tuple[float, float]:
+    """
+    Like `calibrate_alongtrack_dv`, but fits dv_t only over the sub‑arc
+    entries[start_index..end_index]. Returns (dv_t_opt [m/s], rmse_opt [m]).
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4']
+
+    if end_index <= start_index:
+        return 0.0, float('nan')
+
+    # Golden‑section search
+    a, b = bounds
+    phi = (math.sqrt(5.0) - 1.0) / 2.0
+    c = b - phi*(b - a)
+    d = a + phi*(b - a)
+
+    def f(dv: float) -> float:
+        errs = _propagation_error_series_range(sat, start_index, end_index, forces, step_seconds, dv_t=dv)
+        return _rms(errs) if errs else float('inf')
+
+    fc = f(c); fd = f(d)
+    it = 0
+    while (b - a) > tol and it < max_iter:
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - phi*(b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + phi*(b - a)
+            fd = f(d)
+        it += 1
+        if verbose:
+            print(f"[cal-range] iter {it:02d}: interval=({a:.6f},{b:.6f})  best≈{min(fc,fd):.3f} m")
+
+    dv_opt = (a + b) / 2.0
+    rmse_opt = f(dv_opt)
+    if verbose:
+        print(f"[cal-range] dv_t* = {dv_opt:.6f} m/s, RMSE(day‑1) = {rmse_opt:.3f} m")
+    return dv_opt, rmse_opt
+
+
+def test_calibrated_forecast_errors(
+        satellites_dict: dict,
+        forces=None,
+        step_seconds: float = 60.0,
+        constellation = 'G',
+        show_plot: bool = True,
+        verbose: bool = True,
+        cal_bounds: tuple[float, float] = (-0.1, 0.1),
+        cal_tol: float = 1e-4,
+        cal_max_iter: int = 60
+) -> pd.DataFrame:
+    """
+    For each satellite: calibrate dv_t on the **first 24h** (from its first epoch),
+    then start from the **last epoch of day‑1** and propagate forward to every
+    subsequent broadcast epoch, computing position errors. Aggregate mean/std
+    vs Δt since calibration end across satellites.
+
+    Returns a DataFrame with columns ['dt_min','mean_m','std_m','n'] and
+    shows a plot if `show_plot` is True.
+    """
+    if forces is None:
+        forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+    sat_ids = sorted(satellites_dict.keys())
+    if constellation:
+        sat_ids = [sid for sid in sat_ids if sid.startswith(constellation)]
+    if not sat_ids:
+        raise ValueError("No satellites selected – check constellation filter.")
+
+    errors_by_dt = defaultdict(list)
+
+    for sid in sat_ids:
+        sat = satellites_dict[sid]
+        entries = sat.entries
+        if len(entries) < 3:
+            continue
+        # split day‑1 vs the rest
+        idx_cal_end = _first_day_end_index(entries)
+        if idx_cal_end < 1 or idx_cal_end >= len(entries)-1:
+            # either too few in day‑1 or no future epochs – skip
+            if verbose:
+                print(f"[cal-fore] {sid}: insufficient epochs in day‑1 or no future – skipping")
+            continue
+
+        # calibrate on [0 .. idx_cal_end]
+        if verbose:
+            print(f"[cal-fore] {sid}: calibrating on {idx_cal_end+1} epochs (first day)")
+        dv_opt, rmse_opt = calibrate_alongtrack_dv_on_range(
+            sat, start_index=0, end_index=idx_cal_end,
+            forces=forces, step_seconds=step_seconds,
+            bounds=cal_bounds, tol=cal_tol, max_iter=cal_max_iter, verbose=False)
+
+        # evaluate forward from idx_cal_end to the end, starting at that epoch with dv applied
+        epoch0 = entries[idx_cal_end][0]
+        x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, idx_cal_end)
+        r = (x0, y0, z0)
+        v = (vx0, vy0, vz0)
+        if dv_opt != 0.0:
+            v = _apply_alongtrack_delta_v(v, dv_opt)
+        t_cur = epoch0
+
+        if verbose:
+            print(f"[cal-fore] {sid}: dv_t*={dv_opt:.6f} m/s  – evaluating future ({len(entries)-idx_cal_end-1} epochs)")
+
+        for k in range(idx_cal_end+1, len(entries)):
+            epoch_k = entries[k][0]
+            r, v = propagate_rk4(r, v, t_cur, epoch_k, step=step_seconds, forces=forces)
+            t_cur = epoch_k
+            x_t, y_t, z_t, *_ = sat_state_eci(sat, k)
+            err = math.sqrt((r[0]-x_t)**2 + (r[1]-y_t)**2 + (r[2]-z_t)**2)
+
+            dt_min = int(round((epoch_k - epoch0).total_seconds() / 60.0))
+            errors_by_dt[dt_min].append(err)
+
+    if not errors_by_dt:
+        raise RuntimeError("No error data accumulated – check inputs")
+
+    dts = sorted(errors_by_dt.keys())
+    means, stds, counts = [], [], []
+    for dt in dts:
+        vals = errors_by_dt[dt]
+        counts.append(len(vals))
+        means.append(stats.fmean(vals))
+        stds.append(stats.stdev(vals) if len(vals) > 1 else 0.0)
+
+    summary = pd.DataFrame({'dt_min': dts, 'mean_m': means, 'std_m': stds, 'n': counts})
+
+    if show_plot:
+        plt.figure()
+        plt.plot(summary['dt_min'], summary['mean_m'], label='Mean position error after calibration [m]')
+        lower = [m - s for m, s in zip(summary['mean_m'], summary['std_m'])]
+        upper = [m + s for m, s in zip(summary['mean_m'], summary['std_m'])]
+        plt.fill_between(summary['dt_min'], lower, upper, alpha=0.2, label='± Standard deviation')
+        plt.xlabel('Δt since end of day‑1 calibration [minutes]')
+        plt.ylabel('Position error [m]')
+        plt.title('Forecast error after day‑1 calibration – mean and std across satellites')
+        plt.grid(True, which='both', alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return summary
 
 # ---------------------------------------------------------------------------
 #  קריאה לדוגמה – שנה כרצונך
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    run_propagation_tests(
-        sat_name="G01",         # לווין GPS לדוגמה
-        epoch0_index=0,         # אפוק התחלתי
-        delta_minutes_list=(72*60, 4*24*60, 5*24*60),
-        step_seconds=60.0       # צעד RK
+    # ---------- Ensure a recent BRDC exists (via ~/.netrc or EARTHDATA_TOKEN) ---------- #
+    auto_dl = os.environ.get('RINEX_AUTO_DL', '1') in ('1', 'true', 'True')
+    if auto_dl:
+        print("[BRDC] Ensuring latest BRDC files (today/back to 2 days)...")
+        ensured = ensure_latest_brdc(max_days_back=2, out_dir=RINEX_DIR)
+        for p in ensured:
+            print(f"[BRDC] ready: {p}")
+
+    # ---------- Run the parser ---------- #
+    records = load_rinex_dir(RINEX_DIR)
+    satellites = {sid: Satellite(sid, recs) for sid, recs in records.items()}
+
+    sky = SkyImage.from_existing_satellites(satellites)
+
+    # --- Evaluate forecast errors after calibrating on the first 24h ---
+    summary_cal = test_calibrated_forecast_errors(
+        satellites,
+        forces=['central','J2','J3','J4','Moon', "Sun","SRP"],
+        step_seconds=60.0,
+        constellation='G',
+        show_plot=True,
+        verbose=True,
+        cal_bounds=(-0.1, 0.1),
+        cal_tol=1e-4,
+        cal_max_iter=60,
     )
+    print(summary_cal.head())
