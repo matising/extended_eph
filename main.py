@@ -1155,6 +1155,96 @@ class SkyImage:
          self.predictions: dict[str, list[tuple[datetime.datetime, tuple[float,float,float,float,float,float]]]] = {}
          # per-satellite along-track calibration (delta-v)
          self.calibration_dv: dict[str, float] = {}
+     def calibrate_and_propagate(self,
+                                days: float,
+                                output_every_minutes: int = 120,
+                                step_seconds: float = 60.0,
+                                forces = None,
+                                sat_filter = None,
+                                verbose: bool = True) -> None:
+        """
+        Calibrate using all available history (first->last epoch) and propagate
+        from the FIRST epoch forward to (last_epoch + days).
+        
+        This mimics the 'Calibrated' method from analyze_accuracy.py which
+        showed superior stability/accuracy by fitting a long arc.
+        """
+        if forces is None:
+            forces = ['central','J2','J3','J4', "Sun", "Moon", "SRP"]
+
+        ids = self.list_satellites()
+        if sat_filter:
+            ids = [sid for sid in ids if sid in sat_filter]
+
+        self.predictions.clear()
+        self.calibration_dv = {}
+
+        for sid in ids:
+            sat = self.satellites[sid]
+            entries = sat.entries
+            if not entries:
+                continue
+
+            # 1. Calibrate on full range
+            dv_opt = 0.0
+            rmse_opt = 0.0
+            if len(entries) >= 2:
+                try:
+                    # calibrate_alongtrack_dv_on_range uses indices
+                    last_idx = len(entries) - 1
+                    dv_opt, rmse_opt = calibrate_alongtrack_dv_on_range(
+                        sat, 0, last_idx,
+                        forces=forces, step_seconds=step_seconds,
+                        verbose=False
+                    )
+                except Exception as e:
+                    if verbose: print(f"Calibration failed for {sid}: {e}")
+                    dv_opt = 0.0
+
+            self.calibration_dv[sid] = dv_opt
+
+            # 2. Propagate from FIRST epoch
+            epoch0 = entries[0][0]
+            last_epoch = entries[-1][0]
+            
+            # Initial state at epoch0
+            x0, y0, z0, vx0, vy0, vz0 = sat_state_eci(sat, 0)
+            v0 = (vx0, vy0, vz0)
+            
+            # Apply optimized delta-v
+            if dv_opt != 0.0:
+                 # Manually apply along-track dv: v_new = v + dv * (v/|v|)
+                 v_mag = math.sqrt(vx0**2 + vy0**2 + vz0**2)
+                 if v_mag > 0:
+                     factor = 1.0 + dv_opt/v_mag
+                     v0 = (vx0*factor, vy0*factor, vz0*factor)
+
+            r, v = (x0, y0, z0), v0
+            
+            # Target time: last_epoch + days
+            target_time = last_epoch + datetime.timedelta(days=days)
+            
+            if verbose:
+                print(f"[cal] {sid}: dv={dv_opt:.6f} m/s, rmse={rmse_opt:.2f} m. Propagating {epoch0} -> {target_time}")
+
+            # Propagate loop
+            pred_list = []
+            current_epoch = epoch0
+            step_out = max(1, abs(int(output_every_minutes)))
+            
+            # We want to ensure we cover up to target_time
+            while current_epoch < target_time:
+                next_epoch = current_epoch + datetime.timedelta(minutes=step_out)
+                if next_epoch > target_time:
+                    next_epoch = target_time
+                    
+                r, v = propagate_rk4(r, v, current_epoch, next_epoch,
+                                     step=step_seconds, forces=forces)
+                pred_list.append((next_epoch, (*r, *v)))
+                current_epoch = next_epoch
+
+            self.predictions[sid] = pred_list
+
      def calibrate_and_forecast(self,
                                 days_ahead: float,
                                 output_every_minutes: int = 120,

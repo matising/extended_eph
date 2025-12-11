@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 
-from main import ensure_latest_brdc, load_rinex_dir, SkyImage, Satellite, RINEX_DIR
+from main import ensure_latest_brdc, download_brdc_with_fallback, load_rinex_dir, SkyImage, Satellite, RINEX_DIR
 
 app = FastAPI()
 
@@ -69,17 +69,27 @@ async def update_rinex_data():
                  return
 
             print("Updating RINEX data...")
-            # 1. Ensure latest BRDC
-            ensure_latest_brdc(max_days_back=2, out_dir=RINEX_DIR)
+            # 1. Ensure latest BRDC + 3 days history for calibration
+            # We want today and 3 days back
+            today = datetime.date.today()
+            calibration_days = 3
             
+            # Download history
+            for i in range(calibration_days + 1):
+                day = today - datetime.timedelta(days=i)
+                try:
+                    download_brdc_with_fallback(day, out_dir=RINEX_DIR)
+                except Exception as e:
+                    print(f"Warning: could not fetch BRDC for {day}: {e}")
+
             # 2. Load and propagate
             raw_data = load_rinex_dir(RINEX_DIR)
             satellites = {sid: Satellite(sid, entries) for sid, entries in raw_data.items()}
             state.sky_image = SkyImage(satellites)
             
-            # Propagate for 14 days (or configured max)
-            print(f"Propagating for {state.propagation_days} days...")
-            state.sky_image.propagate_all(
+            # Calibrate and Propagate
+            print(f"Calibrating and Propagating for {state.propagation_days} days...")
+            state.sky_image.calibrate_and_propagate(
                 days=state.propagation_days,
                 output_every_minutes=120, # 2 hours resolution for broadcast
                 step_seconds=60.0,
